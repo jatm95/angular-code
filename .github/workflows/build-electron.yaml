@@ -9,7 +9,7 @@ on:
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   GCS_BUCKET: ${{ secrets.GCS_BUCKET_NAME }}
-  APP_NAME: athena-dashboard
+  APP_NAME: ath-dashboard
 
 permissions:
   contents: read
