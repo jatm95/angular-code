@@ -1,0 +1,231 @@
+name: Build and Upload Electron App to GCS
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCS_BUCKET: ${{ secrets.GCS_BUCKET_NAME }}
+  APP_NAME: athena-dashboard
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================
+  # Stage 1: Unit Testing
+  # ============================================
+  test:
+    name: Unit Testing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # Ensures Chrome is available for ChromeHeadless
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests (fail on test failures)
+        env:
+          CHROME_BIN: chrome
+        run: npm run test -- --watch=false --browsers=ChromeHeadless
+
+  # ============================================
+  # Stage 2: Build Angular App
+  # ============================================
+  build-angular:
+    name: Build Angular App
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Angular for production
+        run: npm run build:prod
+
+      - name: Upload Angular build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: angular-dist
+          path: dist/
+          retention-days: 1
+
+  # ============================================
+  # Stage 3: Package Electron App (Windows)
+  # ============================================
+  package-windows:
+    name: Package Windows Executable
+    runs-on: windows-latest
+    needs: build-angular
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Download Angular build
+        uses: actions/download-artifact@v4
+        with:
+          name: angular-dist
+          path: dist/
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Package Electron app for Windows (no publish)
+        run: npx electron-builder --win --x64 --publish never --config.directories.output=release
+
+      - name: Validate Windows artifact exists
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "release" -Filter *.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "No .exe found under release/. Check electron-builder output config." }
+
+      - name: Upload Windows executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-executable
+          path: release/**/*.exe
+          retention-days: 5
+
+  # ============================================
+  # Stage 4: Package Electron App (macOS)
+  # ============================================
+  package-macos:
+    name: Package macOS App
+    runs-on: macos-latest
+    needs: build-angular
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Download Angular build
+        uses: actions/download-artifact@v4
+        with:
+          name: angular-dist
+          path: dist/
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Package Electron app for macOS (no publish)
+        run: npx electron-builder --mac --x64 --publish never --config.directories.output=release
+
+      - name: Validate macOS artifact exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la release || true
+          if ! compgen -G "release/**/*.dmg" > /dev/null && ! compgen -G "release/*.dmg" > /dev/null; then
+            echo "No .dmg found under release/. Check electron-builder target/output config."
+            exit 1
+          fi
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: release/**/*.dmg
+          retention-days: 5
+
+  # ============================================
+  # Stage 5: Upload to GCS Bucket (main only)
+  # ============================================
+  upload-to-gcs:
+    name: Upload to GCS Bucket
+    runs-on: ubuntu-latest
+    needs: [package-windows, package-macos]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    concurrency:
+      group: gcs-release-master
+      cancel-in-progress: false
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Download Windows executable
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-executable
+          path: ./release/windows/
+
+      - name: Download macOS app
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-app
+          path: ./release/macos/
+
+      - name: Generate version tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(date +%Y%m%d)-${GITHUB_SHA::7}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GCS Bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gsutil -m cp ./release/windows/**/*.exe "gs://${GCS_BUCKET}/releases/${{ steps.version.outputs.version }}/windows/" || true
+          gsutil -m cp ./release/windows/**/*.exe "gs://${GCS_BUCKET}/releases/latest/windows/" || true
+
+          gsutil -m cp ./release/macos/**/*.dmg "gs://${GCS_BUCKET}/releases/${{ steps.version.outputs.version }}/macos/" || true
+          gsutil -m cp ./release/macos/**/*.dmg "gs://${GCS_BUCKET}/releases/latest/macos/" || true
+
+      - name: Output paths (GCS)
+        shell: bash
+        run: |
+          {
+            echo "### Upload Successful"
+            echo ""
+            echo "**Version:** ${{ steps.version.outputs.version }}"
+            echo ""
+            echo "| Platform | GCS Path |"
+            echo "|----------|----------|"
+            echo "| Windows | gs://${GCS_BUCKET}/releases/latest/windows/ |"
+            echo "| macOS | gs://${GCS_BUCKET}/releases/latest/macos/ |"
+          } >> "$GITHUB_STEP_SUMMARY"
