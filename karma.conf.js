@@ -30,10 +30,19 @@ module.exports = function(config) {
     customLaunchers: {
       ChromeHeadlessNoSandbox: {
         base: 'ChromeHeadless',
-        flags: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--remote-debugging-port=9222']
+        flags: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-gpu',
+          '--remote-debugging-port=9222',
+          '--disable-dev-shm-usage',
+          '--no-zygote',
+          '--disable-background-networking',
+          '--disable-background-timer-throttling'
+        ]
       }
     },
     browsers: ['ChromeHeadlessNoSandbox'],
-    singleRun: false
+    singleRun: !!process.env.CI
   });
 };
